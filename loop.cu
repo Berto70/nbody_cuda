@@ -9,8 +9,8 @@
 #include <time.h>
 #include <chrono>
 
-#define N 16384  // number of particles 
-#define BLOCK_SIZE 128 // p <= N/40 
+#define N 1024  // number of particles 
+#define BLOCK_SIZE 256 // p <= N/40 
 #define G 1.0 // gravitational constant
 // #define DT 0.0000001 // time step 
 // #define EPSILON 0.00001 // softening parameter
@@ -18,7 +18,7 @@
 
 #define DT 0.0001f // time step 
 #define EPS2 1e-9f // softening parameter
-#define STEPS 10 // simulation steps
+#define STEPS 500000 // simulation steps
 #define L 100.0 // box size
 
 __host__ void compute_com(float4 *pos, float3 *com) {
@@ -178,8 +178,8 @@ int main() {
 
     // Initialize data
     double mass_range[2] = {1.0, 10.0};      // Masses between 1.0 and 10.0
-    double pos_range[2] = {-50.0, 50.0};     // Positions between -50.0 and 50.0 --> L = 100.0
-    double vel_range[2] = {-1.0, 1.0};       // Velocities between -1.0 and 1.0
+    double pos_range[2] = {-5.0, 5.0};     // Positions between -50.0 and 50.0 --> L = 100.0
+    double vel_range[2] = {-.0, 1.0};       // Velocities between -1.0 and 1.0
 
     ic_random_uniform(N, mass_range, pos_range, vel_range, h_pos, h_vel, 1);
     clock_t memGen_out = clock();
@@ -230,7 +230,7 @@ int main() {
     double memAlloc_time = (double)(memAlloc_out - memAlloc_in) / CLOCKS_PER_SEC;
     std::cout << "Device mem alloc: " << memAlloc_time << " s\n";
 
-    /* FILE *fp = fopen("boh_output.csv", "w");
+    FILE *fp = fopen("loop_output.csv", "w");
     if (!fp) {
         printf("Error opening file\n");
         return 1;
@@ -239,7 +239,7 @@ int main() {
     fseek(fp, 0, SEEK_END);
     if (ftell(fp) == 0) {
         fprintf(fp, "ID,t_step,pos_x,pos_y,pos_z\n");
-    } */
+    }
 
 
     auto beginTime = std::chrono::high_resolution_clock::now();
@@ -267,14 +267,17 @@ int main() {
             // Update center of mass calculation or output as needed
         } */
 
-        cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost);
-        /* if (step % 100 == 0) {
-            for (int i = 0; i < N; i++) {
+        if (step % 100 == 0) {
+            cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < 25; i++) {
                 fprintf(fp, "%d,%d,%.6f,%.6f,%.6f\n",
                     i, step, h_pos[i].x, h_pos[i].y, h_pos[i].z);
             }
-        } */
+        }
     }
+    fclose(fp);
+
+
     clock_t kernel_out = clock();
     double kernel_time = (double)(kernel_out - kernel_in) / CLOCKS_PER_SEC;
     std::cout << "Kernel time: " << kernel_time << " s\n";
@@ -282,12 +285,11 @@ int main() {
     auto endTime = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - beginTime).count();
     
-    double gflops = (20.0 * N * N * STEPS) / (1e6 * ms);
+    double gflops = 1e-6 * N * N / ms * 20 * STEPS;
     
     std::cout << "Time: " << ms << " ms\n";
     std::cout << "GFLOPS: " << gflops << std::endl;
 
-    /* fclose(fp); */
     
     // // Copy final positions back for analysis
     // cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost);
