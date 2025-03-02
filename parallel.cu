@@ -1,3 +1,16 @@
+/* 
+ * N-body simulator - Parallelized with CUDA
+ * Author: Gabriele Bertinelli
+ * Modern Computing for Physics course - University of Padova
+ * 2024 - 2025
+ */
+
+// How to compile the script:
+// nvcc nbody_cuda/parallel.cu -o nbody_cuda/bin/parallel -O3 --use_fast_math -arch=sm_75
+// -O3: optimization level 3 (max)
+// --use_fast_math: enable fast math operations
+// -arch=sm_75: specify the GPU architecture
+
 #include <stdio.h> 
 #include <stdlib.h> 
 #include <math.h> 
@@ -9,21 +22,283 @@
 #include <time.h>
 #include <chrono>
 
+
+//##############################################################################
+//# CONSTANTS
+//##############################################################################
 #define N 16836  // number of particles 
-#define BLOCK_SIZE 512 // p <= N/40 
+#define BLOCK_SIZE 256 // p <= N/40 
 #define G 1.0 // gravitational constant
-// #define DT 0.0000001 // time step 
-// #define EPSILON 0.00001 // softening parameter
-// #define STEPS 1000000 // simulation steps
 
 #define evolt 0.315f
-
 #define DT 0.000001f // time step 
 #define EPS2 1e-9f // softening parameter
 #define STEPS 1000 // simulation steps
 #define L 100.0 // box size
 
+
+//##############################################################################
+//# DEVICE FUNCTIONS AND KERNELS 
+//##############################################################################
+
+/**
+ * @brief Compute gravitational acceleration between two bodies using Newton's law
+ * 
+ * This device function calculates the gravitational acceleration exerted by body j
+ * on body i, and adds it to the current acceleration of body i. It implements
+ * the pairwise interaction for an N-body gravitational simulation.
+ * 
+ * The calculation includes a softening factor (EPS2) to prevent numerical 
+ * instabilities when bodies are very close to each other.
+ * 
+ * FLOP count: 20 floating-point operations per call.
+ * We use CUDA's float4 data type for descriptions. Using float4 (instead of float3) 
+ * data allows coalesced memory access to the arrays of data in device memory, 
+ * resulting in efficient memory requests and transfers. 
+ * 
+ * @param bi Position and mass of body i (x, y, z, mass) - the current body
+ * @param bj Position and mass of body j (x, y, z, mass) - the interacting body
+ * @param ai Current acceleration vector of body i
+ * @return Updated acceleration vector of body i after adding contribution from body j
+ * 
+ * @note This function is executed on the device (GPU).
+ */
+__device__ float3 computeAcceleration(float4 bi, float4 bj, float3 ai) {
+    float3 r;
+
+    // r_ij [3 FLOPS]
+    r.x = bj.x - bi.x;
+    r.y = bj.y - bi.y;
+    r.z = bj.z - bi.z;
+    
+    // ||r_ij||^2 + eps^2 [6 FLOPS]
+    float distSqr = r.x*r.x + r.y*r.y + r.z*r.z + EPS2;
+
+    // 1/distSqr^(3/2) [4 FLOPS]
+    float distSixth = distSqr * distSqr * distSqr;
+    float invDistCube = rsqrtf(distSixth);
+    
+    // m_j * 1/distSqr^(3/2) [1 FLOP]
+    float s = bj.w * invDistCube;
+    
+    // a_i = a_i + s * r_ij [6 FLOPS]
+    ai.x += s * r.x;
+    ai.y += s * r.y;
+    ai.z += s * r.z;
+    
+    return ai; // tot [20 FLOPS]
+}
+
+/**
+ * @brief Calculates the acceleration contribution from all particles in the current tile
+ *
+ * This device function computes the gravitational contribution to a particle's acceleration 
+ * from all other particles in the shared memory tile.
+ * 
+ * A tile is evaluated as p threads performing the same sequence of operations 
+ * on different data. Each thread updates the acceleration of one body as a result of 
+ * its interaction with p other bodies. 
+ * The function loada p body descriptions from device memory into shared memory 
+ * provided to each thread block by CUDA. Each thread block evaluates p successive 
+ * interactions. The result of the tile calculation is p updated acceleration.
+ *
+ * @param[in] myPos The position of the current particle (x, y, z, mass)
+ * @param[out] accel The current accumulated acceleration vector of the particle
+ * @return Updated acceleration vector after accounting for all particles in the tile
+ *
+ * @note This function requires shared memory to be allocated and populated with 
+ *       particle positions before being called. The shared memory size must be at 
+ *       least sizeof(float4) * blockDim.x.
+ */
+__device__ float3 tileCalculation(float4 myPos, float3 accel) {
+
+    // Shared memory for positions of particles in the tile
+    extern __shared__ float4 shPosition[];
+    #pragma unroll 
+    for (int i = 0; i < blockDim.x; i++) {
+        accel = computeAcceleration(myPos, shPosition[i], accel);
+    }
+    return accel;
+}
+
+/**
+ * @brief CUDA kernel that calculates the gravitational forces between particles in an N-body simulation.
+ *
+ * This kernel computes the acceleration for each particle due to gravitational interactions
+ * with all other particles in the simulation. It uses a tiled approach with shared memory
+ * to improve performance by reducing global memory accesses.
+ * 
+ * In a thread block there are N/p tiles, with p threads computing the forces 
+ * on p bodies. A thread block reloads its shared memory every p steps to share 
+ * p positions of data. Each thread in a block computes all N interactions for one body.
+ * The code calculates N-body forces for a thread block. 
+ * 
+ * The loop over the tiles requires two synchronization points:  
+ * 
+ * 1. The first synchronization ensures that all shared memory locations 
+ * are populated before the computation proceeds;  
+ * 
+ * 2. the second ensures that all threads finish their computation before 
+ * advancing to the next tile. 
+ *
+ * Each thread computes the net acceleration for one particle by:
+ * 
+ * 1. Loading its assigned particle position
+ * 
+ * 2. Processing all other particles in tiles using shared memory
+ * 
+ * 3. Computing partial accelerations for each tile
+ * 
+ * 4. Accumulating the final acceleration vector
+ *
+ * @param[in] d_pos Pointer to particle positions in global memory (as float4 array where x,y,z = position, w = mass)
+ * @param[out] d_acc Pointer to acceleration output array in global memory (as float4 array)
+ *
+ * @note Requires shared memory allocation of blockDim.x * sizeof(float4) bytes at kernel launch
+ * @note N must be defined as a global constant representing the total number of bodies
+ * @note This function is executed on the device (GPU).
+ */
+__global__ void forceCalculation(void *d_pos, void *d_acc) { 
+    
+    extern __shared__ float4 shPosition[];
+
+    // assign them to local pointers with type conversion 
+    // so they can be indexed as arrays
+    float4 *globPos = (float4*)d_pos;
+    float4 *globAcc = (float4*)d_acc;
+    float4 myPos;
+    int i, tile;
+
+    float3 acc = {0.0f, 0.0f, 0.0f};
+    int p = blockDim.x;
+    int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    myPos = globPos[gtid];
+
+    for (i = 0, tile = 0; i < N; i += p, tile++) {
+
+        int idx = tile * blockDim.x + threadIdx.x;
+
+        shPosition[threadIdx.x] = globPos[idx];
+        
+        __syncthreads();
+        acc = tileCalculation(myPos, acc);
+        __syncthreads();
+    }
+
+    // Save the result in global memory for the integration step.
+   float4 acc4 = {acc.x, acc.y, acc.z, 0.0f};
+   globAcc[gtid] = acc4;
+}
+
+/**
+ * @brief CUDA kernel that updates positions of particles in an N-body simulation
+ *
+ * This kernel updates the positions of n particles based on their velocities and
+ * accelerations using the Leapfrog integration method, without the half-step.
+ * 
+ * @param[in] n Number of bodies
+ * @param pos Array of particle positions (and mass) as float4 where x,y,z are positions
+ * @param[in] vel Array of particle velocities as float4 where x,y,z are velocity components
+ * @param[in] acc Array of particle accelerations as float4 where x,y,z are acceleration components
+ * @param[in] dt Time step for the simulation
+ *
+ * @note Each thread processes one particle, because the integration scales as O(N), 
+ * thus this impacts less on the overall performance.
+ * @note This function is executed on the device (GPU).
+ */
+__global__ void updatePositions(int n, float4 *pos, float4 *vel, float4 *acc, float dt) { 
+    
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+    if(i < n) { 
+        pos[i].x += vel[i].x*dt + 0.5 * acc[i].x * dt * dt; 
+        pos[i].y += vel[i].y*dt + 0.5 * acc[i].y * dt * dt; 
+        pos[i].z += vel[i].z*dt + 0.5 * acc[i].z * dt * dt;  
+    } 
+}
+
+/**
+ * @brief CUDA kernel that updates velocities of particles in an N-body simulation
+ *
+ * This kernel updates the velocity of each body based on old and new accelerations
+ * using the Leapfrog integration method, without the half-step.
+ *
+ * @param[in] n Number of bodies
+ * @param vel Array of float4 values representing velocities (x,y,z components)
+ * @param[in] oldAcc Array of float4 values representing accelerations at time t
+ * @param[in] newAcc Array of float4 values representing accelerations at time t+dt
+ * @param[in] dt Time step size
+ * 
+ * @note Each thread processes one particle, because the integration scales as O(N), 
+ * thus this impacts less on the overall performance.
+ * @note This function is executed on the device (GPU).
+ */
+__global__ void updateVelocities(int n, float4 *vel, float4 *oldAcc, float4 *newAcc, 
+                               double dt) { 
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+    if(i < n) { 
+        vel[i].x += 0.5 * (oldAcc[i].x + newAcc[i].x) * dt; 
+        vel[i].y += 0.5 * (oldAcc[i].y + newAcc[i].y) * dt; 
+        vel[i].z += 0.5 * (oldAcc[i].z + newAcc[i].z) * dt; 
+    } 
+}
+
+/**
+ * @brief CUDA kernel to compute the total energy of an N-body system
+ * 
+ * This kernel calculates both kinetic and potential energy for each particle
+ * and accumulates them to get the total energy of the system. Each thread
+ * processes one particle's energy contribution.
+ * 
+ * @param[in] n Number of bodies
+ * @param[in] pos Array of float4 values where (x,y,z) is the position and w is the mass of each particle
+ * @param[in] vel Array of float4 values where (x,y,z) is the velocity of each particle
+ * @param[out] totEn Pointer to store the resulting total energy
+ * 
+ * @note This function is executed on the device (GPU).
+ */
+__global__ void computeEnergy(int n, float4 *pos, float4 *vel, float1 *totEn) {
+    float1 kinetic = {0.0f};
+    float1 potential = {0.0f};
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < n) {
+        #pragma unroll 16
+        for (int j = 0; j < n; j++) {
+            if (i != j) {
+                float3 r;
+                r.x = pos[j].x - pos[i].x;
+                r.y = pos[j].y - pos[i].y;
+                r.z = pos[j].z - pos[i].z;
+                
+                float distSqr = r.x * r.x + r.y * r.y + r.z * r.z + EPS2;
+                float distSixth = distSqr * distSqr * distSqr;
+                potential.x -= (pos[i].w * pos[j].w) / sqrt(distSixth);
+            }
+        }
+    }
+
+    kinetic.x += 0.5 * pos[i].w * (vel[i].x * vel[i].x + vel[i].y * vel[i].y + vel[i].z * vel[i].z);
+    totEn->x = kinetic.x + potential.x;
+}
+
+
+//##############################################################################
+//# HOST FUNCTIONS
+//##############################################################################
+
+/**
+ * @brief Computes the center of mass for a system of bodies
+ *
+ * This function calculates the center of mass for a system of N bodies by computing
+ * the weighted average of positions based on the mass of each body. 
+ *
+ * @param[in] pos Array of float4 values where x,y,z represent positions and w represents mass
+ * @param[out] com Pointer to float3 where the calculated center of mass will be stored
+ *
+ * @note This function is executed on the host (CPU).
+ */
 __host__ void compute_com(float4 *pos, float3 *com) {
+    
     double total_mass = 0.0;
     
     for (int i = 0; i < N; i++) {
@@ -39,15 +314,29 @@ __host__ void compute_com(float4 *pos, float3 *com) {
 }
 
 /**
- * Generate random initial conditions for N particles using uniform distributions
+ * @brief Initializes particle positions and velocities with uniform random values
+ *
+ * This function generates a random N-body system with particles distributed 
+ * uniformly within the specified ranges. Each particle is assigned a random mass,
+ * position, and velocity within the provided bounds. If requested, the system 
+ * can be centered at its center of mass.
+ *
+ * @param[in] n_particles Number of particles to initialize
+ * @param[in] mass_range Array of two doubles specifying [min, max] mass range
+ * @param[in] pos_range Array of two doubles specifying [min, max] position range for all dimensions
+ * @param[in] vel_range Array of two doubles specifying [min, max] velocity range for all dimensions
+ * @param[out] pos Pointer to array of float4 values where positions will be stored (x,y,z are position, w is mass)
+ * @param[out] vel Pointer to array of float4 values where velocities will be stored (x,y,z are velocity, w unused)
+ * @param[in] center_of_mass If 1, shifts all positions to center the system at the center of mass
+ *
+ * @note Uses a fixed random seed (42) for reproducible results.
+ * @note This function is executed on the host (CPU).
  */
-__host__ void ic_random_uniform(
-    int n_particles, 
-    double mass_range[2],
-    double pos_range[2],
-    double vel_range[2],
-    float4 *pos, float4 *vel,
-    int center_of_mass) {
+__host__ void ic_random_uniform(int n_particles, 
+                                double mass_range[2],
+                                double pos_range[2],
+                                double vel_range[2],
+                                float4 *pos, float4 *vel, int center_of_mass) {
     // Initialize random number generator
     srand(42);
     
@@ -82,122 +371,25 @@ __host__ void ic_random_uniform(
     }
 }
 
-__device__ float3 computeAcceleration(float4 bi, float4 bj, float3 ai) {
-    float3 r;
-
-    // r_ij [3 FLOPS]
-    r.x = bj.x - bi.x;
-    r.y = bj.y - bi.y;
-    r.z = bj.z - bi.z;
-    
-    // ||r_ij||^2 + eps^2 [6 FLOPS]
-    float distSqr = r.x*r.x + r.y*r.y + r.z*r.z + EPS2;
-
-    // 1/distSqr^(3/2) [4 FLOPS]
-    float distSixth = distSqr * distSqr * distSqr;
-    float invDistCube = rsqrtf(distSixth);
-    
-    // m_j * 1/distSqr^(3/2) [1 FLOP]
-    float s = bj.w * invDistCube;
-    
-    // a_i = a_i + s * r_ij [6 FLOPS]
-    ai.x += s * r.x;
-    ai.y += s * r.y;
-    ai.z += s * r.z;
-    
-    return ai; // tot [20 FLOPS]
-}
-
-__device__ float3 tileCalculation(float4 myPos, float3 accel) {
-
-    // Shared memory for positions of particles in the tile
-    extern __shared__ float4 shPosition[];
-    #pragma unroll 128
-    for (int i = 0; i < blockDim.x; i++) {
-        accel = computeAcceleration(myPos, shPosition[i], accel);
-    }
-    return accel;
-}
-
-__global__ void forceCalculation(void *d_pos, void *d_acc) { 
-    
-    extern __shared__ float4 shPosition[];
-
-    // assign them to local pointers with type conversion 
-    // so they can be indexed as arrays
-    float4 *globPos = (float4*)d_pos;
-    float4 *globAcc = (float4*)d_acc;
-    float4 myPos;
-    int i, tile;
-
-    float3 acc = {0.0f, 0.0f, 0.0f};
-    int p = blockDim.x;
-    int gtid = blockIdx.x * blockDim.x + threadIdx.x;
-    myPos = globPos[gtid];
-
-    for (i = 0, tile = 0; i < N; i += p, tile++) {
-
-        int idx = tile * blockDim.x + threadIdx.x;
-
-        shPosition[threadIdx.x] = globPos[idx];
-        
-        __syncthreads();
-        acc = tileCalculation(myPos, acc);
-        __syncthreads();
-    }
-
-    // Save the result in global memory for the integration step.
-   float4 acc4 = {acc.x, acc.y, acc.z, 0.0f};
-   globAcc[gtid] = acc4;
-}
-
-__global__ void updatePositions(int n, float4 *pos, float4 *vel, float4 *acc, float dt) { 
-    
-    int i = blockIdx.x * blockDim.x + threadIdx.x; 
-    if(i < n) { 
-        pos[i].x += vel[i].x*dt + 0.5 * acc[i].x * dt * dt; 
-        pos[i].y += vel[i].y*dt + 0.5 * acc[i].y * dt * dt; 
-        pos[i].z += vel[i].z*dt + 0.5 * acc[i].z * dt * dt;  
-    } 
-}
-
-__global__ void updateVelocities(int n, float4 *vel, float4 *oldAcc, float4 *newAcc, 
-                               double dt) { 
-    int i = blockIdx.x * blockDim.x + threadIdx.x; 
-    if(i < n) { 
-        vel[i].x += 0.5 * (oldAcc[i].x + newAcc[i].x) * dt; 
-        vel[i].y += 0.5 * (oldAcc[i].y + newAcc[i].y) * dt; 
-        vel[i].z += 0.5 * (oldAcc[i].z + newAcc[i].z) * dt; 
-    } 
-}
-
-__global__ void computeEnergy(int n, float4 *pos, float4 *vel, float1 *totEn) {
-    float1 kinetic = {0.0f};
-    float1 potential = {0.0f};
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i < n) {
-        #pragma unroll
-        for (int j = 0; j < n; j++) {
-            if (i != j) {
-                float3 r;
-                r.x = pos[j].x - pos[i].x;
-                r.y = pos[j].y - pos[i].y;
-                r.z = pos[j].z - pos[i].z;
-                
-                float distSqr = r.x * r.x + r.y * r.y + r.z * r.z + EPS2;
-                float distSixth = distSqr * distSqr * distSqr;
-                potential.x -= (pos[i].w * pos[j].w) / sqrt(distSixth);
-            }
-        }
-    }
-
-    kinetic.x += 0.5 * pos[i].w * (vel[i].x * vel[i].x + vel[i].y * vel[i].y + vel[i].z * vel[i].z);
-    totEn->x = kinetic.x + potential.x;
-}
-
-void computePerfStats(double &interactionsPerSecond, double &gflops, float milliseconds, int iterations)
-{
+/**
+ * @brief Calculates performance statistics for the N-body simulation.
+ *
+ * This function computes two performance metrics:
+ * 1. Interactions per second (in billions) - how many body-body interactions are computed per second
+ * 2. GFLOPS - floating point operations per second (in billions)
+ *
+ * The calculation assumes that each body-body interaction requires 20 floating-point operations.
+ * Performance is based on the total number of bodies (N), iteration count, and execution time.
+ *
+ * @param[out] interactionsPerSecond Computed interactions per second (in billions)
+ * @param[out] gflops Computed GFLOPS (floating point operations per second in billions)
+ * @param[in] milliseconds Total execution time in milliseconds
+ * @param[in] iterations Number of simulation iterations performed
+ * 
+ * @note This function is executed on the host (CPU).
+ */
+__host__ void computePerfStats(double &interactionsPerSecond, double &gflops, 
+                                float milliseconds, int iterations) {
     const int flopsPerInteraction = 20;
     interactionsPerSecond = (float)N * (float)N;
     interactionsPerSecond *= 1e-9 * iterations * 1000 / milliseconds;
@@ -205,9 +397,9 @@ void computePerfStats(double &interactionsPerSecond, double &gflops, float milli
 
 }
 
-int returnPosition(int sims) { 
+void returnPosition(int sims) { 
     // Host memory
-    clock_t memGen_in = clock();
+    // clock_t memGen_in = clock();
     float4 *h_pos = (float4*)malloc(N * sizeof(float4));
     float4 *h_vel = (float4*)malloc(N * sizeof(float4));
     float3 *com = (float3*)malloc(sizeof(float3));
@@ -221,9 +413,9 @@ int returnPosition(int sims) {
         double vel_range[2] = {-1.0, 1.0};       // Velocities between -1.0 and 1.0
 
         ic_random_uniform(N, mass_range, pos_range, vel_range, h_pos, h_vel, 1);
-        clock_t memGen_out = clock();
-        double memGen_time = (double)(memGen_out - memGen_in) / CLOCKS_PER_SEC;
-        std::cout << "Host mem alloc + body gen: " << memGen_time << " s\n";
+        // clock_t memGen_out = clock();
+        // double memGen_time = (double)(memGen_out - memGen_in) / CLOCKS_PER_SEC;
+        // std::cout << "Host mem alloc + body gen: " << memGen_time << " s\n";
     
     } else if (sims == 2) {
 
@@ -244,7 +436,7 @@ int returnPosition(int sims) {
         h_vel[2].x = 0.0; h_vel[2].y = 0.0; h_vel[2].z = 0.0; h_vel[2].w = 0.0;
     }
 
-    clock_t memAlloc_in = clock();
+    // clock_t memAlloc_in = clock();
     // Device memory - using float4 for positions, velocities and accelerations
     float4 *d_pos, *d_vel, *d_acc_old, *d_acc_new;
     float1 *d_totEn;
@@ -264,9 +456,9 @@ int returnPosition(int sims) {
     
     // Initialize old acceleration to zero
     cudaMemset(d_acc_old, 0, N * sizeof(float4));
-    clock_t memAlloc_out = clock();
-    double memAlloc_time = (double)(memAlloc_out - memAlloc_in) / CLOCKS_PER_SEC;
-    std::cout << "Device mem alloc: " << memAlloc_time << " s\n";
+    // clock_t memAlloc_out = clock();
+    // double memAlloc_time = (double)(memAlloc_out - memAlloc_in) / CLOCKS_PER_SEC;
+    // std::cout << "Device mem alloc: " << memAlloc_time << " s\n";
 
     /* FILE *fp = fopen("parallel_output.csv", "w");
     if (!fp) {
@@ -480,6 +672,8 @@ void runBenchmark(int iterations)
 int main() {
     // returnPosition();
     // returnEnergy();
-    runBenchmark(STEPS);
+    for (int i = 0; i < 1; i++) {
+        runBenchmark(STEPS);
+    }
     return 0;
 } 
