@@ -147,7 +147,7 @@ __global__ void forceCalculation(void *d_pos, void *d_acc) {
     // Save the result in global memory for the integration step.
    float4 acc4 = {acc.x, acc.y, acc.z, 0.0f};
    globAcc[gtid] = acc4;
-}
+}  
 
 __global__ void updatePositions(int n, float4 *pos, float4 *vel, float4 *acc, float dt) { 
     
