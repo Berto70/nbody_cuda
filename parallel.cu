@@ -194,7 +194,7 @@ __global__ void forceCalculation(void *d_pos, void *d_acc) {
  * @brief CUDA kernel that updates positions of particles in an N-body simulation
  *
  * This kernel updates the positions of n particles based on their velocities and
- * accelerations using the Leapfrog integration method, without the half-step.
+ * accelerations using the Verlet integration method.
  * 
  * @param[in] n Number of bodies
  * @param pos Array of particle positions (and mass) as float4 where x,y,z are positions
@@ -220,7 +220,7 @@ __global__ void updatePositions(int n, float4 *pos, float4 *vel, float4 *acc, fl
  * @brief CUDA kernel that updates velocities of particles in an N-body simulation
  *
  * This kernel updates the velocity of each body based on old and new accelerations
- * using the Leapfrog integration method, without the half-step.
+ * using the velocity Verlet integration method.
  *
  * @param[in] n Number of bodies
  * @param vel Array of float4 values representing velocities (x,y,z components)
@@ -389,21 +389,51 @@ __host__ void ic_random_uniform(int n_particles,
  * @note This function is executed on the host (CPU).
  */
 __host__ void computePerfStats(double &interactionsPerSecond, double &gflops, 
-                                float milliseconds, int iterations) {
+                                float milliseconds) {
     const int flopsPerInteraction = 20;
     interactionsPerSecond = (float)N * (float)N;
-    interactionsPerSecond *= 1e-9 * iterations * 1000 / milliseconds;
+    interactionsPerSecond *= 1e-9 * STEPS * 1000 / milliseconds;
     gflops = interactionsPerSecond * (float)flopsPerInteraction;
 
 }
 
-void returnPosition(int sims) { 
+//##############################################################################
+//# MAIN FUNCTIONS
+//##############################################################################
+
+/**
+ * @brief Simulates the time evolution of an N-body system using CUDA.
+ *
+ * This function handles the complete N-body simulation workflow:
+ * 1. Allocates host and device memory for particle data
+ * 2. Initializes particle positions and velocities based on the simulation type
+ * 3. Executes the time integration using velocity Verlet algorithm in parallel on GPU
+ * 4. Optionally saves simulation data and energy values to output files
+ * 5. Cleans up memory before exiting
+ *
+ * The simulation can be initialized in different ways:
+ * - Random uniform distribution (sims > 3)
+ * - Two-body system (sims = 2), set to have e=0.0 and rp=0.1
+ * - Three-body system (sims = 3). It's the problem set by Lagrange: 
+ * three masses in a equatorial triangle
+ *
+ * @param[in] sims Simulation type:
+ *             - sims > 3: Random uniform distribution
+ *             - sims = 2: Two-body system
+ *             - sims = 3: Three-body system
+ * @param[in] save_data Whether to save particle positions to output CSV file (1=yes, 0=no)
+ * @param[in] energy Whether to compute and save total energy (1=yes, 0=no)
+ * @param[in] save_steps Frequency of saving data (save every save_steps iterations)
+ *
+ * @note Writes output to "parallel_output.csv" when save_data=1
+ * @note Writes energy values to "parallel_energy.csv" when both save_data=1 and energy=1
+ */
+void evolveSystem(int sims, int save_data, int energy, int save_steps) { 
     // Host memory
     // clock_t memGen_in = clock();
     float4 *h_pos = (float4*)malloc(N * sizeof(float4));
     float4 *h_vel = (float4*)malloc(N * sizeof(float4));
     float3 *com = (float3*)malloc(sizeof(float3));
-    float1 *h_totEn = (float1*)malloc(sizeof(float1));
 
     // Initialize data
     if (sims > 3) {
@@ -439,20 +469,23 @@ void returnPosition(int sims) {
     // clock_t memAlloc_in = clock();
     // Device memory - using float4 for positions, velocities and accelerations
     float4 *d_pos, *d_vel, *d_acc_old, *d_acc_new;
-    float1 *d_totEn;
     
     // Allocate memory for float4 arrays
     cudaMalloc(&d_pos, N * sizeof(float4));
     cudaMalloc(&d_vel, N * sizeof(float4));
     cudaMalloc(&d_acc_old, N * sizeof(float4));
-    cudaMalloc(&d_acc_new, N * sizeof(float4));
-    cudaMalloc(&d_totEn, sizeof(float1));
-    
+    cudaMalloc(&d_acc_new, N * sizeof(float4));     
     
     // Copy initial data to device
     cudaMemcpy(d_pos, h_pos, N * sizeof(float4), cudaMemcpyHostToDevice);
     cudaMemcpy(d_vel, h_vel, N * sizeof(float4), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_totEn, h_totEn, sizeof(float1), cudaMemcpyHostToDevice);
+    
+    if (energy) {
+        float1 *h_totEn = (float1*)malloc(sizeof(float1));
+        float1 *d_totEn;
+        cudaMalloc(&d_totEn, sizeof(float1));
+        cudaMemcpy(d_totEn, h_totEn, sizeof(float1), cudaMemcpyHostToDevice);
+    }
     
     // Initialize old acceleration to zero
     cudaMemset(d_acc_old, 0, N * sizeof(float4));
@@ -460,142 +493,37 @@ void returnPosition(int sims) {
     // double memAlloc_time = (double)(memAlloc_out - memAlloc_in) / CLOCKS_PER_SEC;
     // std::cout << "Device mem alloc: " << memAlloc_time << " s\n";
 
-    /* FILE *fp = fopen("parallel_output.csv", "w");
-    if (!fp) {
-        printf("Error opening file\n");
-        return 1;
-    }
-    // If the file is empty, write the header.
-    fseek(fp, 0, SEEK_END);
-    if (ftell(fp) == 0) {
-        fprintf(fp, "ID,t_step,pos_x,pos_y,pos_z\n");
+    if (save_data) {
+        FILE *fp = fopen("parallel_output.csv", "w");
+        if (!fp) {
+            printf("Error opening file\n");
+            return 1;
+        }
+        // If the file is empty, write the header.
+        fseek(fp, 0, SEEK_END);
+        if (ftell(fp) == 0) {
+            fprintf(fp, "ID,t_step,pos_x,pos_y,pos_z\n");
+        }
+    }       
+
+    if (save_data && energy) {
+        FILE *fpe = fopen("parallel_energy.csv", "w");
+        if (!fpe) {
+            printf("Error opening file\n");
+            return 1;
+        }
+        // If the file is empty, write the header.
+        fseek(fpe, 0, SEEK_END);
+        if (ftell(fpe) == 0) {
+            fprintf(fpe, "t_step,e_tot\n");
+        }
     }
 
-    FILE *fpe = fopen("parallel_energy.csv", "w");
-    if (!fpe) {
-        printf("Error opening file\n");
-        return 1;
-    }
-    // If the file is empty, write the header.
-    fseek(fpe, 0, SEEK_END);
-    if (ftell(fpe) == 0) {
-        fprintf(fpe, "t_step,e_tot\n");
-    } */
+    // KERNELS
 
     int numBlocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int sharedMemSize = BLOCK_SIZE * sizeof(float4);
 
-    for (int step = 0; step < STEPS; step++) {
-        // Calculate forces and update accelerations
-        forceCalculation<<<numBlocks, BLOCK_SIZE, sharedMemSize>>>(d_pos, d_acc_new);
-        
-        // Update positions
-        updatePositions<<<numBlocks, BLOCK_SIZE>>>(N, d_pos, d_vel, d_acc_old, DT);
-        
-        // Update velocities
-        updateVelocities<<<numBlocks, BLOCK_SIZE>>>(N, d_vel, d_acc_old, d_acc_new, DT);
-
-        /* computeEnergy<<<numBlocks, BLOCK_SIZE>>>(N, d_pos, d_vel, d_totEn);
-        cudaMemcpy(h_totEn, d_totEn, sizeof(float1), cudaMemcpyDeviceToHost); */
-        
-        // Copy new acceleration to old acceleration
-        cudaMemcpy(d_acc_old, d_acc_new, N * sizeof(float4), cudaMemcpyDeviceToDevice);
-
-        cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost);
-        /* if (step % 100 == 0) {
-            fprintf(fpe,"%d,%.6f\n", step, h_totEn->x);
-            for (int i = 0; i < N; i++) {
-                fprintf(fp, "%d,%d,%.6f,%.6f,%.6f\n",
-                    i, step, h_pos[i].x, h_pos[i].y, h_pos[i].z);
-            }
-        } */
-    }
-
-    /* fclose(fp);
-    fclose(fpe); */
-
-    // Cleanup
-    cudaFree(d_pos);
-    cudaFree(d_vel);
-    cudaFree(d_acc_old);
-    cudaFree(d_acc_new);
-    cudaFree(d_totEn);
-    
-    free(h_pos);
-    free(h_vel);
-    free(com);
-    free(h_totEn);
-
-    return 0;
-}
-
-int returnEnergy() {
-    // Host memory
-    clock_t memGen_in = clock();
-    float4 *h_pos = (float4*)malloc(N * sizeof(float4));
-    float4 *h_vel = (float4*)malloc(N * sizeof(float4));
-    float3 *com = (float3*)malloc(sizeof(float3));
-    float1 *h_totEn = (float1*)malloc(sizeof(float1));
-
-    /* // Initialize data
-    double mass_range[2] = {1.0, 10.0};      // Masses between 1.0 and 10.0
-    double pos_range[2] = {-50.0, 50.0};     // Positions between -50.0 and 50.0 --> L = 100.0
-    double vel_range[2] = {-1.0, 1.0};       // Velocities between -1.0 and 1.0
-
-    ic_random_uniform(N, mass_range, pos_range, vel_range, h_pos, h_vel, 1); */
-
-    // two-body sys
-    h_pos[0].x = 0.0; h_pos[0].y = 0.0; h_pos[0].z = 0.0; h_pos[0].w = 8.0;
-    h_pos[1].x = 0.1; h_pos[1].y = 0.0; h_pos[1].z = 0.0; h_pos[1].w = 2.0;
-    h_vel[0].x = 0.0; h_vel[0].y = -2.0; h_vel[0].z = 0.0; h_vel[0].w = 0.0;
-    h_vel[1].x = 0.0; h_vel[1].y = 8.0; h_vel[1].z = 0.0; h_vel[1].w = 0.0;
-
-    clock_t memGen_out = clock();
-    double memGen_time = (double)(memGen_out - memGen_in) / CLOCKS_PER_SEC;
-    std::cout << "Host mem alloc + body gen: " << memGen_time << " s\n";
-
-    clock_t memAlloc_in = clock();
-    // Device memory - using float4 for positions, velocities and accelerations
-    float4 *d_pos, *d_vel, *d_acc_old, *d_acc_new;
-    float1 *d_totEn;
-    
-    // Allocate memory for float4 arrays
-    cudaMalloc(&d_pos, N * sizeof(float4));
-    cudaMalloc(&d_vel, N * sizeof(float4));
-    cudaMalloc(&d_acc_old, N * sizeof(float4));
-    cudaMalloc(&d_acc_new, N * sizeof(float4));
-    cudaMalloc(&d_totEn, sizeof(float1));
-    
-    
-    // Copy initial data to device
-    cudaMemcpy(d_pos, h_pos, N * sizeof(float4), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vel, h_vel, N * sizeof(float4), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_totEn, h_totEn, sizeof(float1), cudaMemcpyHostToDevice);
-    
-    // Initialize old acceleration to zero
-    cudaMemset(d_acc_old, 0, N * sizeof(float4));
-    clock_t memAlloc_out = clock();
-    double memAlloc_time = (double)(memAlloc_out - memAlloc_in) / CLOCKS_PER_SEC;
-    std::cout << "Device mem alloc: " << memAlloc_time << " s\n";
-
-    FILE *fp = fopen("parallel_energy.csv", "w");
-    if (!fp) {
-        printf("Error opening file\n");
-        return 1;
-    }
-    // If the file is empty, write the header.
-    fseek(fp, 0, SEEK_END);
-    if (ftell(fp) == 0) {
-        fprintf(fp, "t_step,e_tot\n");
-    }
-
-
-    auto beginTime = std::chrono::high_resolution_clock::now();
-
-    int numBlocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int sharedMemSize = BLOCK_SIZE * sizeof(float4);
-
-    clock_t kernel_in = clock();
     for (int step = 0; step < STEPS; step++) {
         // Calculate forces and update accelerations
         forceCalculation<<<numBlocks, BLOCK_SIZE, sharedMemSize>>>(d_pos, d_acc_new);
@@ -607,54 +535,77 @@ int returnEnergy() {
         updateVelocities<<<numBlocks, BLOCK_SIZE>>>(N, d_vel, d_acc_old, d_acc_new, DT);
 
         // Compute total energy
-        computeEnergy<<<numBlocks, BLOCK_SIZE>>>(N, d_pos, d_vel, d_totEn);
-
-        cudaMemcpy(h_totEn, d_totEn, sizeof(float1), cudaMemcpyDeviceToHost);
+        if (energy) {
+            computeEnergy<<<numBlocks, BLOCK_SIZE>>>(N, d_pos, d_vel, d_totEn);
+        }
         
         // Copy new acceleration to old acceleration
         cudaMemcpy(d_acc_old, d_acc_new, N * sizeof(float4), cudaMemcpyDeviceToDevice);
         
-        if (step % 100 == 0) {
-            fprintf(fp,"%d,%.6f\n", step, h_totEn->x);\
+        if (save_data) {
+            if (step % save_steps == 0) {
+                if (energy && save_data) {
+                    // Copy total energy to host and write to file
+                    cudaMemcpy(h_totEn, d_totEn, sizeof(float1), cudaMemcpyDeviceToHost);
+                    fprintf(fpe,"%d,%.6f\n", step, h_totEn->x);
+                }   
+                for (int i = 0; i < N; i++) {
+                    // Copy position to host and write to file
+                    cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost);
+                    fprintf(fp, "%d,%d,%.6f,%.6f,%.6f\n",
+                        i, step, h_pos[i].x, h_pos[i].y, h_pos[i].z);
+                }
+            }
         }
-        
     }
-    clock_t kernel_out = clock();
-    double kernel_time = (double)(kernel_out - kernel_in) / CLOCKS_PER_SEC;
-    std::cout << "Kernel time: " << kernel_time << " s\n";
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - beginTime).count();
-    
-    double gflops = (20.0 * N * N * STEPS) / (1e6 * ms);
-    
-    std::cout << "Time: " << ms << " ms\n";
-    std::cout << "GFLOPS: " << gflops << std::endl;
-
-    fclose(fp);
+    if (save_data) {
+        fclose(fp);
+    }
+    if (save_data && energy) {
+        fclose(fpe);
+    }
 
     // Cleanup
     cudaFree(d_pos);
     cudaFree(d_vel);
     cudaFree(d_acc_old);
     cudaFree(d_acc_new);
-    cudaFree(d_totEn);
     
     free(h_pos);
     free(h_vel);
     free(com);
-    free(h_totEn);
+    
+    if (energy) {
+        cudaFree(d_totEn);
+        free(h_totEn);
+    }
 
     return 0;
 }
 
-void runBenchmark(int iterations)
-{
+/**
+ * @brief Executes the N-body simulation benchmark
+ *
+ * This function executes the N-body simulation to measure performance.
+ * It first runs one iteration without timing to prime the GPU (warm-up),
+ * then executes the actual timed run.
+ * After the timed run, it calculates and reports performance statistics 
+ * including execution time, interactions per second, and GFLOPS.
+ *
+ * Priming the GPU helps remove any one-time initialization overhead such as \
+ * context setup, lazy memory allocation, and caching. This ensures that the timed 
+ * benchmark run reflects steady-state performance rather than being skewed 
+ * by startup delays.
+ *
+ */
+void runBenchmark() {
+        
     // once without timing to prime the GPU
-    returnPosition(N);
+    evolveSystem(N,0,0,100);
 
     clock_t t_start = clock();  
-        returnPosition(N);
+        evolveSystem(N,0,0,100);
     clock_t t_end = clock();  
 
     float milliseconds = ((float)t_end - (float)t_start) / CLOCKS_PER_SEC * 1000;
@@ -669,11 +620,22 @@ void runBenchmark(int iterations)
     
 }
 
+/**
+ * @brief Main funtion for the CUDA N-body simulation script.
+ * 
+ * This function executies the N-body simulation.
+ * The user can switch between evolving the system, through evolveSystem(), and
+ * running the benchmark, through runBenchmark(), and choosing the number of
+ * iterations to run.
+ * 
+ */
 int main() {
-    // returnPosition();
-    // returnEnergy();
+
+    // evolveSystem();
+    
     for (int i = 0; i < 1; i++) {
-        runBenchmark(STEPS);
+        runBenchmark();
     }
+
     return 0;
 } 
