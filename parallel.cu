@@ -26,8 +26,8 @@
 //##############################################################################
 //# CONSTANTS
 //##############################################################################
-#define N 65536  // number of particles 
-#define BLOCK_SIZE 1024 // p <= N/40 
+#define N 65536 // number of particles 
+#define BLOCK_SIZE 128 // p <= N/40 
 #define G 1.0 // gravitational constant
 
 #define evolt 0.315f
@@ -653,7 +653,7 @@ template<bool unrollLoop>
     double gflops = 0;
     computePerfStats(interactionsPerSecond, gflops, milliseconds);
 
-    FILE *fp = fopen("nbody_cuda/data/block_size.csv", "a");
+    FILE *fp = fopen("nbody_cuda/data/timer.csv", "a");
     if (!fp) {
         printf("Error opening file\n");
         return;
@@ -661,9 +661,9 @@ template<bool unrollLoop>
     // If the file is empty, write the header.
     fseek(fp, 0, SEEK_END);
     if (ftell(fp) == 0) {
-        fprintf(fp, "p,n_bodies,gflops,inter\n");
+        fprintf(fp, "n_bodies,time\n");
     }
-    fprintf(fp, "%d,%d,%0.3f,%0.3f\n", BLOCK_SIZE, N, gflops, interactionsPerSecond);
+    fprintf(fp, "%d,%0.3f\n", N, milliseconds);
     fclose(fp);
     
     //printf("%d bodies, total time for %d iterations: %0.3f ms\n", 
