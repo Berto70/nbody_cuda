@@ -117,10 +117,18 @@ template<bool unrollLoop>
 
     // Shared memory for positions of particles in the tile
     extern __shared__ float4 shPosition[];
-    if (unrollLoop) {#pragma unroll 16}
-    for (int i = 0; i < blockDim.x; i++) {
+    if (unrollLoop) {
+     #pragma unroll 4
+     for (int i = 0; i < blockDim.x; i++) {
         accel = computeAcceleration(myPos, shPosition[i], accel);
+        }
     }
+    else {
+        for (int i = 0; i < blockDim.x; i++) {
+            accel = computeAcceleration(myPos, shPosition[i], accel);
+        }
+    }
+
     return accel;
 }
 
@@ -177,7 +185,6 @@ template<bool unrollLoop>
     int p = blockDim.x;
     int gtid = blockIdx.x * blockDim.x + threadIdx.x;
     myPos = globPos[gtid];
-
     for (i = 0, tile = 0; i < N; i += p, tile++) {
 
         int idx = tile * blockDim.x + threadIdx.x;
@@ -433,12 +440,17 @@ __host__ void computePerfStats(double &interactionsPerSecond, double &gflops,
  * @note Writes energy values to "parallel_energy.csv" when both save_data=1 and energy=1
  */
 template<bool unrollLoop>
-void evolveSystem(int sims, int save_data, int energy, int save_steps) { 
+int evolveSystem(int sims, int save_data, int energy, int save_steps) { 
     // Host memory
     // clock_t memGen_in = clock();
     float4 *h_pos = (float4*)malloc(N * sizeof(float4));
     float4 *h_vel = (float4*)malloc(N * sizeof(float4));
     float3 *com = (float3*)malloc(sizeof(float3));
+
+    FILE *fp = NULL;
+    FILE *fpe = NULL;
+    float1 *h_totEn = NULL;
+    float1 *d_totEn = NULL;
 
     // Initialize data
     if (sims > 3) {
@@ -531,7 +543,7 @@ void evolveSystem(int sims, int save_data, int energy, int save_steps) {
 
     for (int step = 0; step < STEPS; step++) {
         // Calculate forces and update accelerations
-        forceCalculation<<<numBlocks, BLOCK_SIZE, sharedMemSize>>>(d_pos, d_acc_new);
+        forceCalculation<unrollLoop><<<numBlocks, BLOCK_SIZE, sharedMemSize>>>(d_pos, d_acc_new);
         
         // Update positions
         updatePositions<<<numBlocks, BLOCK_SIZE>>>(N, d_pos, d_vel, d_acc_old, DT);
@@ -608,19 +620,19 @@ template<bool unrollLoop>
  void runBenchmark() {
         
     // once without timing to prime the GPU
-    evolveSystem(N,0,0,100);
+    evolveSystem<unrollLoop>(N,0,0,100);
 
     clock_t t_start = clock();  
-        evolveSystem(N,0,0,100);
+    evolveSystem<unrollLoop>(N,0,0,100);
     clock_t t_end = clock();  
 
     float milliseconds = ((float)t_end - (float)t_start) / CLOCKS_PER_SEC * 1000;
     double interactionsPerSecond = 0;
     double gflops = 0;
-    computePerfStats(interactionsPerSecond, gflops, milliseconds, iterations);
+    computePerfStats(interactionsPerSecond, gflops, milliseconds);
     
     printf("%d bodies, total time for %d iterations: %0.3f ms\n", 
-           N, iterations, milliseconds);
+           N, STEPS, milliseconds);
     printf("= %0.3f billion interactions per second\n", interactionsPerSecond);
     printf("= %0.3f GFLOP/s at %d flops per interaction\n", gflops, 20);
     
@@ -640,7 +652,7 @@ int main() {
     // evolveSystem<false>();
     
     for (int i = 0; i < 1; i++) {
-        runBenchmark<true>();
+        runBenchmark<false>();
     }
 
     return 0;
