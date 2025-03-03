@@ -110,11 +110,12 @@ __device__ float3 computeAcceleration(float4 bi, float4 bj, float3 ai) {
  *       particle positions before being called. The shared memory size must be at 
  *       least sizeof(float4) * blockDim.x.
  */
-__device__ float3 tileCalculation(float4 myPos, float3 accel) {
+template<bool unrollLoop>
+ __device__ float3 tileCalculation(float4 myPos, float3 accel) {
 
     // Shared memory for positions of particles in the tile
     extern __shared__ float4 shPosition[];
-    #pragma unroll 
+    if (unrollLoop) {#pragma unroll 16}
     for (int i = 0; i < blockDim.x; i++) {
         accel = computeAcceleration(myPos, shPosition[i], accel);
     }
@@ -158,7 +159,8 @@ __device__ float3 tileCalculation(float4 myPos, float3 accel) {
  * @note N must be defined as a global constant representing the total number of bodies
  * @note This function is executed on the device (GPU).
  */
-__global__ void forceCalculation(void *d_pos, void *d_acc) { 
+template<bool unrollLoop>
+ __global__ void forceCalculation(void *d_pos, void *d_acc) { 
     
     extern __shared__ float4 shPosition[];
 
@@ -181,7 +183,7 @@ __global__ void forceCalculation(void *d_pos, void *d_acc) {
         shPosition[threadIdx.x] = globPos[idx];
         
         __syncthreads();
-        acc = tileCalculation(myPos, acc);
+        acc = tileCalculation<unrollLoop>(myPos, acc);
         __syncthreads();
     }
 
@@ -428,6 +430,7 @@ __host__ void computePerfStats(double &interactionsPerSecond, double &gflops,
  * @note Writes output to "parallel_output.csv" when save_data=1
  * @note Writes energy values to "parallel_energy.csv" when both save_data=1 and energy=1
  */
+template<bool unrollLoop>
 void evolveSystem(int sims, int save_data, int energy, int save_steps) { 
     // Host memory
     // clock_t memGen_in = clock();
@@ -599,7 +602,8 @@ void evolveSystem(int sims, int save_data, int energy, int save_steps) {
  * by startup delays.
  *
  */
-void runBenchmark() {
+template<bool unrollLoop>
+ void runBenchmark() {
         
     // once without timing to prime the GPU
     evolveSystem(N,0,0,100);
@@ -631,10 +635,10 @@ void runBenchmark() {
  */
 int main() {
 
-    // evolveSystem();
+    // evolveSystem<false>();
     
     for (int i = 0; i < 1; i++) {
-        runBenchmark();
+        runBenchmark<true>();
     }
 
     return 0;
