@@ -26,7 +26,7 @@
 //##############################################################################
 //# CONSTANTS
 //##############################################################################
-#define N 16836  // number of particles 
+#define N 16384  // number of particles 
 #define BLOCK_SIZE 256 // p <= N/40 
 #define G 1.0 // gravitational constant
 
@@ -118,7 +118,7 @@ template<bool unrollLoop>
     // Shared memory for positions of particles in the tile
     extern __shared__ float4 shPosition[];
     if (unrollLoop) {
-     #pragma unroll 4
+     #pragma unroll 16
      for (int i = 0; i < blockDim.x; i++) {
         accel = computeAcceleration(myPos, shPosition[i], accel);
         }
@@ -616,7 +616,7 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
  * by startup delays.
  *
  */
-template<bool unrollLoop>
+/* template<bool unrollLoop>
  void runBenchmark() {
         
     // once without timing to prime the GPU
@@ -631,10 +631,45 @@ template<bool unrollLoop>
     double gflops = 0;
     computePerfStats(interactionsPerSecond, gflops, milliseconds);
     
-    printf("%d bodies, total time for %d iterations: %0.3f ms\n", 
-           N, STEPS, milliseconds);
+    //printf("%d bodies, total time for %d iterations: %0.3f ms\n", 
+           //N, STEPS, milliseconds);
     printf("= %0.3f billion interactions per second\n", interactionsPerSecond);
-    printf("= %0.3f GFLOP/s at %d flops per interaction\n", gflops, 20);
+    printf("= %0.3f GFLOP/s at %d flops per interaction\n\n", gflops, 20);
+    
+}
+ */
+template<bool unrollLoop>
+ void runBenchmark() {
+        
+    // once without timing to prime the GPU
+    evolveSystem<unrollLoop>(N,0,0,100);
+
+    clock_t t_start = clock();  
+    evolveSystem<unrollLoop>(N,0,0,100);
+    clock_t t_end = clock();  
+
+    float milliseconds = ((float)t_end - (float)t_start) / CLOCKS_PER_SEC * 1000;
+    double interactionsPerSecond = 0;
+    double gflops = 0;
+    computePerfStats(interactionsPerSecond, gflops, milliseconds);
+
+    FILE *fp = fopen("nbody_cuda/data/performance.csv", "a");
+    if (!fp) {
+        printf("Error opening file\n");
+        return;
+    }
+    // If the file is empty, write the header.
+    fseek(fp, 0, SEEK_END);
+    if (ftell(fp) == 0) {
+        fprintf(fp, "yn,n_bodies,gflops,inter\n");
+    }
+    fprintf(fp, "%i,%d,%0.3f,%0.3f\n", unrollLoop, N, gflops, interactionsPerSecond);
+    fclose(fp);
+    
+    //printf("%d bodies, total time for %d iterations: %0.3f ms\n", 
+           //N, STEPS, milliseconds);
+    // printf("= %0.3f billion interactions per second\n", interactionsPerSecond);
+    // printf("= %0.3f GFLOP/s at %d flops per interaction\n\n", gflops, 20);
     
 }
 
@@ -651,8 +686,8 @@ int main() {
 
     // evolveSystem<false>();
     
-    for (int i = 0; i < 1; i++) {
-        runBenchmark<false>();
+    for (int i = 0; i < 11; i++) {
+        runBenchmark<true>();
     }
 
     return 0;
