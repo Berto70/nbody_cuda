@@ -98,14 +98,16 @@ __device__ float3 computeAcceleration(float4 bi, float4 bj, float3 ai) {
  * A tile is evaluated as p threads performing the same sequence of operations 
  * on different data. Each thread updates the acceleration of one body as a result of 
  * its interaction with p other bodies. 
- * The function loada p body descriptions from device memory into shared memory 
+ * The function load p body descriptions from device memory into shared memory 
  * provided to each thread block by CUDA. Each thread block evaluates p successive 
  * interactions. The result of the tile calculation is p updated acceleration.
- *
+ * 
  * @param[in] myPos The position of the current particle (x, y, z, mass)
  * @param[out] accel The current accumulated acceleration vector of the particle
  * @return Updated acceleration vector after accounting for all particles in the tile
  *
+ * @note Unrolling the loop can reduce the number of overhead instructions.
+ * 
  * @note This function requires shared memory to be allocated and populated with 
  *       particle positions before being called. The shared memory size must be at 
  *       least sizeof(float4) * blockDim.x.
