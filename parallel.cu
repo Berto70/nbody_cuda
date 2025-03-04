@@ -113,14 +113,18 @@ __device__ float3 computeAcceleration(float4 bi, float4 bj, float3 ai) {
  *       least sizeof(float4) * blockDim.x.
  */
 template<bool unrollLoop>
- __device__ float3 tileCalculation(float4 myPos, float3 accel) {
+__device__ float3 tileCalculation(float4 myPos, float3 accel) {
 
     // Shared memory for positions of particles in the tile
+    // Memory shared across all threads in a block
     extern __shared__ float4 shPosition[];
+    
     if (unrollLoop) {
-     #pragma unroll 16
-     for (int i = 0; i < blockDim.x; i++) {
-        accel = computeAcceleration(myPos, shPosition[i], accel);
+        #pragma unroll 16 // Unroll the loop to reduce overhead
+        // Iterate through all p in this tile (tile size = blockDim.x)
+        // Each thread processes interactions with all p in shared memory
+        for (int i = 0; i < blockDim.x; i++) {
+            accel = computeAcceleration(myPos, shPosition[i], accel);
         }
     }
     else {
@@ -128,7 +132,8 @@ template<bool unrollLoop>
             accel = computeAcceleration(myPos, shPosition[i], accel);
         }
     }
-
+    
+    // Return the accumulated acceleration in the tile
     return accel;
 }
 
@@ -170,33 +175,45 @@ template<bool unrollLoop>
  * @note This function is executed on the device (GPU).
  */
 template<bool unrollLoop>
- __global__ void forceCalculation(void *d_pos, void *d_acc) { 
+__global__ void forceCalculation(void *d_pos, void *d_acc) { 
     
+    // Shared memory for storing particle data for the current tile
     extern __shared__ float4 shPosition[];
 
-    // assign them to local pointers with type conversion 
+    // Cast void pointers to typed pointers for array indexing
     // so they can be indexed as arrays
     float4 *globPos = (float4*)d_pos;
     float4 *globAcc = (float4*)d_acc;
     float4 myPos;
     int i, tile;
 
+    // Initialize acc accumulator for this thread's particle
     float3 acc = {0.0f, 0.0f, 0.0f};
+    // Number of particles in a tile
     int p = blockDim.x;
+    // Global index - unique identifier for each particle across all blocks
     int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    // Load thread's assigned particle position
     myPos = globPos[gtid];
+
+    // Process all particles in tiles
     for (i = 0, tile = 0; i < N; i += p, tile++) {
 
+        // Calculate the global index for this thread's 
+        // assigned particle in the current tile
         int idx = tile * blockDim.x + threadIdx.x;
 
+        // Each thread loads one particle from the current tile into shared memory
         shPosition[threadIdx.x] = globPos[idx];
         
+        // Ensure all threads have loaded their data before computation
         __syncthreads();
         acc = tileCalculation<unrollLoop>(myPos, acc);
         __syncthreads();
     }
 
-    // Save the result in global memory for the integration step.
+    // Save the result in global memory for the integration step
+    // Convert float3 acceleration to float4
    float4 acc4 = {acc.x, acc.y, acc.z, 0.0f};
    globAcc[gtid] = acc4;
 }
@@ -215,12 +232,19 @@ template<bool unrollLoop>
  *
  * @note Each thread processes one particle, because the integration scales as O(N), 
  * thus this impacts less on the overall performance.
+ * @note The code uses the control construct if (i < n) to handle boundary 
+ * conditions when mapping threads to data. This is usually because the total 
+ * number of threads needs to be a multiple of the block size whereas the size 
+ * of the data can be an arbitrary number.
  * @note This function is executed on the device (GPU).
  */
 __global__ void updatePositions(int n, float4 *pos, float4 *vel, float4 *acc, float dt) { 
     
+    // Calculate global thread index
     int i = blockIdx.x * blockDim.x + threadIdx.x; 
-    if(i < n) { 
+    
+    // Handles the case where the number of particles is not a multiple of the block size
+    if (i < n) { 
         pos[i].x += vel[i].x*dt + 0.5 * acc[i].x * dt * dt; 
         pos[i].y += vel[i].y*dt + 0.5 * acc[i].y * dt * dt; 
         pos[i].z += vel[i].z*dt + 0.5 * acc[i].z * dt * dt;  
@@ -241,12 +265,19 @@ __global__ void updatePositions(int n, float4 *pos, float4 *vel, float4 *acc, fl
  * 
  * @note Each thread processes one particle, because the integration scales as O(N), 
  * thus this impacts less on the overall performance.
+ * @note The code uses the control construct if (i < n) to handle boundary 
+ * conditions when mapping threads to data. This is usually because the total 
+ * number of threads needs to be a multiple of the block size whereas the size 
+ * of the data can be an arbitrary number.
  * @note This function is executed on the device (GPU).
  */
 __global__ void updateVelocities(int n, float4 *vel, float4 *oldAcc, float4 *newAcc, 
-                               double dt) { 
+                               double dt) {
+
     int i = blockIdx.x * blockDim.x + threadIdx.x; 
-    if(i < n) { 
+
+    // Handles the case where the number of particles is not a multiple of the block size
+    if (i < n) { 
         vel[i].x += 0.5 * (oldAcc[i].x + newAcc[i].x) * dt; 
         vel[i].y += 0.5 * (oldAcc[i].y + newAcc[i].y) * dt; 
         vel[i].z += 0.5 * (oldAcc[i].z + newAcc[i].z) * dt; 
