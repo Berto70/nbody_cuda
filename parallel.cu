@@ -639,7 +639,7 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
 }
  */
 template<bool unrollLoop>
- void runBenchmark() {
+void runBenchmark() {
         
     // once without timing to prime the GPU
     evolveSystem<unrollLoop>(N,0,0,100);
