@@ -21,21 +21,29 @@
 #include <cuda.h>
 #include <time.h>
 #include <chrono>
+#include <assert.h>
 
 
 //##############################################################################
 //# CONSTANTS
 //##############################################################################
-#define N 65536 // number of particles 
+#define N 6 // number of particles 
 #define BLOCK_SIZE 128 // p <= N/40 
 #define G 1.0 // gravitational constant
 
 #define evolt 0.315f
 #define DT 0.000001f // time step 
 #define EPS2 1e-9f // softening parameter
-#define STEPS 1000 // simulation steps
+#define STEPS 50000000 // simulation steps
 #define L 100.0 // box size
 
+inline cudaError_t checkCuda(cudaError_t result) {
+    if (result != cudaSuccess) {
+      fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+      assert(result == cudaSuccess);
+    }
+    return result;
+  }
 
 //##############################################################################
 //# DEVICE FUNCTIONS AND KERNELS 
@@ -479,7 +487,9 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
     float3 *com = (float3*)malloc(sizeof(float3));
 
     FILE *fp = NULL;
+    FILE *fpv = NULL;
     FILE *fpe = NULL;
+
     float1 *h_totEn = NULL;
     float1 *d_totEn = NULL;
 
@@ -487,7 +497,7 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
     if (sims > 3) {
 
         double mass_range[2] = {1.0, 10.0};      // Masses between 1.0 and 10.0
-        double pos_range[2] = {-50.0, 50.0};     // Positions between -50.0 and 50.0 --> L = 100.0
+        double pos_range[2] = {-L/2, L/2};     // Positions between -50.0 and 50.0 --> L = 100.0
         double vel_range[2] = {-1.0, 1.0};       // Velocities between -1.0 and 1.0
 
         ic_random_uniform(N, mass_range, pos_range, vel_range, h_pos, h_vel, 1);
@@ -525,24 +535,24 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
     cudaMalloc(&d_acc_new, N * sizeof(float4));     
     
     // Copy initial data to device
-    cudaMemcpy(d_pos, h_pos, N * sizeof(float4), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vel, h_vel, N * sizeof(float4), cudaMemcpyHostToDevice);
+    checkCuda(cudaMemcpy(d_pos, h_pos, N * sizeof(float4), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(d_vel, h_vel, N * sizeof(float4), cudaMemcpyHostToDevice));
     
+
     if (energy) {
-        float1 *h_totEn = (float1*)malloc(sizeof(float1));
-        float1 *d_totEn;
+        h_totEn = (float1*)malloc(sizeof(float1));
         cudaMalloc(&d_totEn, sizeof(float1));
-        cudaMemcpy(d_totEn, h_totEn, sizeof(float1), cudaMemcpyHostToDevice);
-    }
+    }    
+    cudaMemcpy(d_totEn, h_totEn, sizeof(float1), cudaMemcpyHostToDevice);
     
     // Initialize old acceleration to zero
     cudaMemset(d_acc_old, 0, N * sizeof(float4));
     // clock_t memAlloc_out = clock();
     // double memAlloc_time = (double)(memAlloc_out - memAlloc_in) / CLOCKS_PER_SEC;
     // std::cout << "Device mem alloc: " << memAlloc_time << " s\n";
-
+    
     if (save_data) {
-        FILE *fp = fopen("parallel_output.csv", "w");
+        fp = fopen("parallel_output.csv", "w");
         if (!fp) {
             printf("Error opening file\n");
             return 1;
@@ -552,10 +562,22 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
         if (ftell(fp) == 0) {
             fprintf(fp, "ID,t_step,pos_x,pos_y,pos_z\n");
         }
-    }       
 
-    if (save_data && energy) {
-        FILE *fpe = fopen("parallel_energy.csv", "w");
+        fpv = fopen("velocity_output.csv", "w");
+        if (!fpv) {
+            printf("Error opening file\n");
+            return 1;
+        }
+        // If the file is empty, write the header.
+        fseek(fpv, 0, SEEK_END);
+        if (ftell(fpv) == 0) {
+            fprintf(fpv, "ID,t_step,vel_x,vel_y,vel_z\n");
+        }
+    }       
+           
+
+    if (energy) {
+        fpe = fopen("parallel_energy.csv", "w");
         if (!fpe) {
             printf("Error opening file\n");
             return 1;
@@ -566,8 +588,10 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
             fprintf(fpe, "t_step,e_tot\n");
         }
     }
+    
 
     // KERNELS
+    clock_t kernel_in = clock();
 
     int numBlocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int sharedMemSize = BLOCK_SIZE * sizeof(float4);
@@ -575,42 +599,70 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
     for (int step = 0; step < STEPS; step++) {
         // Calculate forces and update accelerations
         forceCalculation<unrollLoop><<<numBlocks, BLOCK_SIZE, sharedMemSize>>>(d_pos, d_acc_new);
-        
+        cudaError_t err_f = cudaGetLastError();
+        if (err_f != cudaSuccess) {
+            printf("CUDA error force: %s\n", cudaGetErrorString(err_f));
+        }
+        cudaDeviceSynchronize(); // Wait for all threads to finish
+
         // Update positions
         updatePositions<<<numBlocks, BLOCK_SIZE>>>(N, d_pos, d_vel, d_acc_old, DT);
+        cudaError_t err_p = cudaGetLastError();
+        if (err_p != cudaSuccess) {
+            printf("CUDA Error pos: %s\n", cudaGetErrorString(err_p));
+        }
+        cudaDeviceSynchronize();
         
         // Update velocities
         updateVelocities<<<numBlocks, BLOCK_SIZE>>>(N, d_vel, d_acc_old, d_acc_new, DT);
+        cudaError_t err_v = cudaGetLastError();
+        if (err_v != cudaSuccess) {
+            printf("CUDA error vel: %s\n", cudaGetErrorString(err_v));
+            return 1;
+        }
+        cudaDeviceSynchronize();
 
         // Compute total energy
         if (energy) {
             computeEnergy<<<numBlocks, BLOCK_SIZE>>>(N, d_pos, d_vel, d_totEn);
+            cudaError_t err_e = cudaGetLastError();
+            if (err_e != cudaSuccess) {
+                printf("CUDA error energy: %s\n", cudaGetErrorString(err_e));
+            }
+            cudaDeviceSynchronize();
         }
         
         // Copy new acceleration to old acceleration
-        cudaMemcpy(d_acc_old, d_acc_new, N * sizeof(float4), cudaMemcpyDeviceToDevice);
+        checkCuda(cudaMemcpy(d_acc_old, d_acc_new, N * sizeof(float4), cudaMemcpyDeviceToDevice));
         
         if (save_data) {
             if (step % save_steps == 0) {
-                if (energy && save_data) {
+                if (energy) {
                     // Copy total energy to host and write to file
-                    cudaMemcpy(h_totEn, d_totEn, sizeof(float1), cudaMemcpyDeviceToHost);
+                    checkCuda(cudaMemcpy(h_totEn, d_totEn, sizeof(float1), cudaMemcpyDeviceToHost));
                     fprintf(fpe,"%d,%.6f\n", step, h_totEn->x);
                 }   
                 for (int i = 0; i < N; i++) {
                     // Copy position to host and write to file
-                    cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost);
+                    checkCuda(cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost));
+                    checkCuda(cudaMemcpy(h_vel, d_vel, N * sizeof(float4), cudaMemcpyDeviceToHost));
+
                     fprintf(fp, "%d,%d,%.6f,%.6f,%.6f\n",
                         i, step, h_pos[i].x, h_pos[i].y, h_pos[i].z);
+                    fprintf(fpv, "%d,%d,%.6f,%.6f,%.6f\n",
+                        i, step, h_vel[i].x, h_vel[i].y, h_vel[i].z);                    
                 }
             }
         }
     }
+    clock_t kernel_out = clock();
+    double kernel_time = (double)(kernel_out - kernel_in) / CLOCKS_PER_SEC;
+    std::cout << "Kernel execution time: " << kernel_time << " s\n";
 
     if (save_data) {
         fclose(fp);
     }
-    if (save_data && energy) {
+    if (energy) {
         fclose(fpe);
     }
 
@@ -646,28 +698,6 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
  * benchmark run reflects steady-state performance rather than being skewed 
  * by startup delays.
  *
- */
-/* template<bool unrollLoop>
- void runBenchmark() {
-        
-    // once without timing to prime the GPU
-    evolveSystem<unrollLoop>(N,0,0,100);
-
-    clock_t t_start = clock();  
-    evolveSystem<unrollLoop>(N,0,0,100);
-    clock_t t_end = clock();  
-
-    float milliseconds = ((float)t_end - (float)t_start) / CLOCKS_PER_SEC * 1000;
-    double interactionsPerSecond = 0;
-    double gflops = 0;
-    computePerfStats(interactionsPerSecond, gflops, milliseconds);
-    
-    //printf("%d bodies, total time for %d iterations: %0.3f ms\n", 
-           //N, STEPS, milliseconds);
-    printf("= %0.3f billion interactions per second\n", interactionsPerSecond);
-    printf("= %0.3f GFLOP/s at %d flops per interaction\n\n", gflops, 20);
-    
-}
  */
 template<bool unrollLoop>
 void runBenchmark() {
@@ -715,11 +745,11 @@ void runBenchmark() {
  */
 int main() {
 
-    // evolveSystem<false>();
+    evolveSystem<true>(N, 1, 1, 1000);
     
-    for (int i = 0; i < 11; i++) {
-        runBenchmark<true>();
-    }
+    // for (int i = 0; i < 11; i++) {
+    //     runBenchmark<true>();
+    // }
 
     return 0;
 } 
