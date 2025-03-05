@@ -120,9 +120,9 @@ __device__ float3 tileCalculation(float4 myPos, float3 accel) {
     extern __shared__ float4 shPosition[];
     
     if (unrollLoop) {
-        #pragma unroll 16 // Unroll the loop to reduce overhead
         // Iterate through all p in this tile (tile size = blockDim.x)
-        // Each thread processes interactions with all p in shared memory
+        // Each thread processes interactions with all p in shared memory
+        #pragma unroll 16 // Unroll the loop to reduce overhead
         for (int i = 0; i < blockDim.x; i++) {
             accel = computeAcceleration(myPos, shPosition[i], accel);
         }
