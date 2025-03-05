@@ -32,10 +32,10 @@
 #define G 1.0 // gravitational constant
 
 #define evolt 0.315f
-#define DT 0.000001f // time step 
-#define EPS2 1e-9f // softening parameter
-#define STEPS 50000000 // simulation steps
-#define L 100.0 // box size
+#define DT 0.00001f // time step 
+#define EPS2 1e-5f // softening parameter
+#define STEPS 5000000 // simulation steps
+#define L 10.0 // box size
 
 inline cudaError_t checkCuda(cudaError_t result) {
     if (result != cudaSuccess) {
@@ -388,7 +388,7 @@ __host__ void ic_random_uniform(int n_particles,
                                 double vel_range[2],
                                 float4 *pos, float4 *vel, int center_of_mass) {
     // Initialize random number generator
-    srand(42);
+    srand(9725);
     
     // Generate uniform random values within ranges
     for (int i = 0; i < n_particles; i++) {
@@ -560,7 +560,7 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
         // If the file is empty, write the header.
         fseek(fp, 0, SEEK_END);
         if (ftell(fp) == 0) {
-            fprintf(fp, "ID,t_step,pos_x,pos_y,pos_z\n");
+            fprintf(fp, "ID,t_step,pos_x,pos_y,pos_z,mass\n");
         }
 
         fpv = fopen("velocity_output.csv", "w");
@@ -647,8 +647,8 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
                     checkCuda(cudaMemcpy(h_pos, d_pos, N * sizeof(float4), cudaMemcpyDeviceToHost));
                     checkCuda(cudaMemcpy(h_vel, d_vel, N * sizeof(float4), cudaMemcpyDeviceToHost));
 
-                    fprintf(fp, "%d,%d,%.6f,%.6f,%.6f\n",
-                        i, step, h_pos[i].x, h_pos[i].y, h_pos[i].z);
+                    fprintf(fp, "%d,%d,%.6f,%.6f,%.6f,%.6f\n",
+                        i, step, h_pos[i].x, h_pos[i].y, h_pos[i].z, h_pos[i].w);
                     fprintf(fpv, "%d,%d,%.6f,%.6f,%.6f\n",
                         i, step, h_vel[i].x, h_vel[i].y, h_vel[i].z);                    
                 }
@@ -661,6 +661,7 @@ int evolveSystem(int sims, int save_data, int energy, int save_steps) {
 
     if (save_data) {
         fclose(fp);
+        fclose(fpv);
     }
     if (energy) {
         fclose(fpe);
@@ -745,7 +746,7 @@ void runBenchmark() {
  */
 int main() {
 
-    evolveSystem<true>(N, 1, 1, 1000);
+    evolveSystem<true>(N, 1, 1, 100);
     
     // for (int i = 0; i < 11; i++) {
     //     runBenchmark<true>();
