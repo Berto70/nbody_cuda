@@ -1,3 +1,5 @@
+# N-body simulator - Parallelized with CUDA
+
 ### Gabriele Bertinelli - 2103359 - Modern Computing for Physics - 24/25
 
 The all-pairs approach to N-body simulation is a brute-force technique that evaluates alla pair-wise interactions among the N bodies. Given its $O(N^2)$ computational complexity, it's an interesting target for acceleration.
